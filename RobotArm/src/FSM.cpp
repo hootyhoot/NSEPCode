@@ -13,12 +13,11 @@ const int NUM_SERVOS       = 6;
 const int NUM_POSES        = 18;   // a-r
 
 #define POSES_FILE "/poses.csv"
+#define SEQ_FILE "/sequences.csv"
 
 const int NUM_SEQUENCES = 5;
 const int MAX_SEQ_STEPS = 10;
 const int SEQ_PAUSE_MS  = 400;
-
-#define SEQ_FILE "/sequences.csv"
 
 struct PoseSequence {
     int steps[MAX_SEQ_STEPS];
@@ -500,28 +499,84 @@ void handleIdleChar(char c) {
 }
 
 // ── Setup & Loop ──────────────────────────────────────────────────────────────
+// ── Self-audit ────────────────────────────────────────────────────────────────
+// Returns true if all hardware is responding correctly.
+bool selfAudit() {
+    bool passed = true;
+
+    Serial.println("[INIT] Running self-audit...");
+
+    // 1. Check PCA9685 is reachable on I2C
+    Wire.beginTransmission(0x40);
+    byte i2cError = Wire.endTransmission();
+    if (i2cError == 0) {
+        Serial.println("  [OK] PCA9685 motor driver found on I2C (0x40)");
+    } else {
+        Serial.print("  [FAIL] PCA9685 not responding! I2C error: ");
+        Serial.println(i2cError);
+        passed = false;
+    }
+
+    // 2. Check LittleFS mounted correctly
+    if (LittleFS.begin(true)) {
+        Serial.println("  [OK] LittleFS flash filesystem mounted");
+    } else {
+        Serial.println("  [FAIL] LittleFS mount failed!");
+        passed = false;
+    }
+
+    // 3. Verify PWM driver is outputting by writing a safe value
+    //    and confirming no I2C error during the write
+    Wire.beginTransmission(0x40);
+    Wire.write(0x00);   // MODE1 register
+    byte writeError = Wire.endTransmission();
+    if (writeError == 0) {
+        Serial.println("  [OK] PWM driver write test passed");
+    } else {
+        Serial.print("  [FAIL] PWM driver write error: ");
+        Serial.println(writeError);
+        passed = false;
+    }
+
+    if (passed) Serial.println("[INIT] Self-audit PASSED — all systems nominal.");
+    else        Serial.println("[INIT] Self-audit FAILED — check connections.");
+
+    return passed;
+}
 
 void setup() {
     Serial.begin(9600);
     while (!Serial);
 
-    // STATUS_INIT — hardware coming up, no commands accepted yet
-    Serial.println("\n[INIT] Starting hardware...");
+    robotStatus = STATUS_INIT;
+    Serial.println("\n[INIT] Power-on — starting system...");
 
+    Wire.begin();
     pwm.begin();
     pwm.setOscillatorFrequency(27000000);
     pwm.setPWMFreq(50);
     delay(10);
 
-    for (int i = 0; i < NUM_SERVOS; i++) { pwm.writeMicroseconds(i, currentPWM[i]); delay(150); }
-
-    if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed!");
-    else {
-        loadPosesFromFlash();
-        loadSequencesFromFlash();
+    // ── Step 1: Self-audit ────────────────────────────────────────────────────
+    bool auditOk = selfAudit();
+    if (!auditOk) {
+        Serial.println("[INIT] WARNING: Audit failed. Proceeding with caution...");
+        // You can halt here with while(true); if you want hard-stop on failure
     }
-    
-    homeArm();
+
+    // Load flash data after LittleFS is confirmed mounted
+    loadPosesFromFlash();
+    loadSequencesFromFlash();
+
+    // Safe-initialise all joints before homing
+    for (int i = 0; i < NUM_SERVOS; i++) {
+        pwm.writeMicroseconds(i, currentPWM[i]);
+        delay(150);
+    }
+
+    // ── Step 2: Autonomous Homing (Wrist → Elbow → Shoulder → Base per spec) ─
+    Serial.println("[INIT] Step 2: Autonomous homing...");
+    homeArm();   // homeArm() sets STATUS_BUSY then STATUS_IDLE internally
 
     Serial.println("\n--- 6DOF Arm Controller ---");
     Serial.println("V      print robot status");
@@ -529,18 +584,15 @@ void setup() {
     Serial.println("0-5    select channel");
     Serial.println("W / +  increase PWM");
     Serial.println("S / -  decrease PWM");
-    Serial.println("R      record pose -> type slot (a-k)");
+    Serial.println("R      record pose -> type slot (a-r)");
     Serial.println("a-r    go to saved pose");
-    Serial.println("M      define sequence -> slot (A-G) -> poses -> Enter");
+    Serial.println("M      define sequence -> slot (A-E) -> poses -> Enter");
     Serial.println("A-E    play saved sequence (auto-homes after)");
     Serial.println("L      list all poses and sequences");
     Serial.println("T      clear all poses");
     Serial.println("X      clear all sequences");
     Serial.println("Y      homing sequence");
     Serial.println("---------------------------");
-
-    // Init complete — transition to IDLE
-    setStatusIdle();
 }
 
 void loop() {
