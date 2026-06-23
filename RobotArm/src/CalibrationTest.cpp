@@ -1,18 +1,20 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <LittleFS.h>
 #include <Adafruit_PWMServoDriver.h>
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 
-const int MIN_PULSE = 75;
-const int MAX_PULSE = 3000;
+const int MIN_PULSE = 330;
+const int MAX_PULSE = 2800;
 const int MAX_ANGLE = 270;
 const int NUM_SERVOS = 6;
-const int NUM_POSES = 9;  // Poses a-g
+const int NUM_POSES = 7;  // Poses a-g
+
+#define POSES_FILE "/poses.csv"
 
 // --- Channel mapping ---------------------------------------------------
-// Adjust these to match how your servos are actually wired to the PCA9685.
 const int CH_SHOULDER   = 0;
 const int CH_ELBOW      = 1;
 const int CH_WRIST      = 2;
@@ -26,9 +28,13 @@ const int CH_BASE       = 5;
 const int HOME_STEP  = 5;
 const int HOME_DELAY = 20;
 
+// --- Pose playback speed control ----------------------------------------
+// POSE_STEP  = microseconds moved per increment when recalling a pose
+// POSE_DELAY = milliseconds paused between increments when recalling a pose
+const int POSE_STEP  = 5;
+const int POSE_DELAY = 15;
+
 // --- Homing target positions (in microseconds) --------------------------
-// 1500 = roughly centered. Adjust CH_GRIPPER's value to your measured
-// "open" PWM value for your gripper hardware.
 int HOME_PWM[NUM_SERVOS] = {
   1795, // CH_SHOULDER
   1460, // CH_ELBOW
@@ -51,8 +57,127 @@ int poseIndex(char c)
     return c - 'a';  // a=0, b=1, c=2 ...
 }
 
+// ---- Flash persistence (LittleFS) --------------------------------------
+void persistPoses()
+{
+    File f = LittleFS.open(POSES_FILE, "w");
+    if (!f)
+    {
+        Serial.println("Error: could not open flash file for writing.");
+        return;
+    }
+
+    for (int p = 0; p < NUM_POSES; p++)
+    {
+        if (!poseSet[p]) continue;
+
+        f.print((char)('a' + p));
+        for (int i = 0; i < NUM_SERVOS; i++)
+        {
+            f.print(',');
+            f.print(savedPoses[p][i]);
+        }
+        f.println();
+    }
+
+    f.close();
+    Serial.println("Poses saved to flash.");
+}
+
+// Reads poses back from flash into savedPoses[] / poseSet[].
+bool loadPosesFromFlash()
+{
+    if (!LittleFS.exists(POSES_FILE))
+    {
+        Serial.println("No saved poses file found on flash.");
+        return false;
+    }
+
+    File f = LittleFS.open(POSES_FILE, "r");
+    if (!f)
+    {
+        Serial.println("Error: could not open flash file for reading.");
+        return false;
+    }
+
+    int loadedCount = 0;
+
+    while (f.available())
+    {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+
+        char slot = line.charAt(0);
+        if (slot < 'a' || slot >= ('a' + NUM_POSES)) continue;
+        int index = poseIndex(slot);
+
+        // Strip the leading "slot," then read NUM_SERVOS comma-separated values
+        int comma = line.indexOf(',');
+        if (comma < 0) continue;
+        line = line.substring(comma + 1);
+
+        int i = 0;
+        while (i < NUM_SERVOS)
+        {
+            comma = line.indexOf(',');
+            String token = (comma >= 0) ? line.substring(0, comma) : line;
+            savedPoses[index][i] = token.toInt();
+            i++;
+            if (comma < 0) break;
+            line = line.substring(comma + 1);
+        }
+
+        if (i == NUM_SERVOS)
+        {
+            poseSet[index] = true;
+            loadedCount++;
+        }
+    }
+
+    f.close();
+    Serial.print("Loaded ");
+    Serial.print(loadedCount);
+    Serial.println(" pose(s) from flash.");
+    return loadedCount > 0;
+}
+
+// Wipes poses from both RAM and flash.
+void clearPosesFromFlash()
+{
+    for (int i = 0; i < NUM_POSES; i++) poseSet[i] = false;
+    LittleFS.remove(POSES_FILE);
+    Serial.println("Cleared all saved poses (RAM + flash).");
+}
+
+
 void moveToPose(int index)
 {
+    int startPWM[NUM_SERVOS];
+    int maxDistance = 0;
+
+    for (int i = 0; i < NUM_SERVOS; i++)
+    {
+        startPWM[i] = currentPWM[i];
+        int distance = abs(savedPoses[index][i] - startPWM[i]);
+        if (distance > maxDistance) maxDistance = distance;
+    }
+
+    int steps = maxDistance / POSE_STEP;
+    if (steps < 1) steps = 1;
+
+    for (int s = 1; s <= steps; s++)
+    {
+        for (int i = 0; i < NUM_SERVOS; i++)
+        {
+            int target = savedPoses[index][i];
+            int value = startPWM[i] + (long)(target - startPWM[i]) * s / steps;
+            pwm.writeMicroseconds(i, value);
+            currentPWM[i] = value;
+        }
+        delay(POSE_DELAY);
+    }
+
     for (int i = 0; i < NUM_SERVOS; i++)
     {
         currentPWM[i] = savedPoses[index][i];
@@ -96,9 +221,6 @@ void printAllPoses()
     }
 }
 
-// Moves a single channel from its current PWM to a target PWM in small
-// increments, with a short delay between each step, so the motion is
-// slow and smooth instead of an instant jump.
 void moveServoSmooth(int channel, int targetPWM, int incrementSize, int delayMs)
 {
     int current = currentPWM[channel];
@@ -124,7 +246,6 @@ void moveServoSmooth(int channel, int targetPWM, int incrementSize, int delayMs)
 }
 
 // Sequential homing: gripper -> wrist -> elbow -> shoulder -> base.
-// Each joint moves smoothly to its home position before the next one starts.
 void homeArm()
 {
     Serial.println("\n>>> HOMING SEQUENCE STARTED <<<");
@@ -164,13 +285,24 @@ void setup()
         delay(150);
     }
 
+    // Mount flash filesystem (true = auto-format if mount fails, e.g. first boot)
+    if (!LittleFS.begin(true))
+    {
+        Serial.println("LittleFS mount failed!");
+    }
+    else
+    {
+        loadPosesFromFlash();
+    }
+
     Serial.println("\n--- 6DOF Calibrator + Pose Recorder ---");
     Serial.println("0-5         = select channel");
     Serial.println("W / +       = increase PWM");
     Serial.println("S / -       = decrease PWM");
-    Serial.println("R + a-g     = record pose to slot");
-    Serial.println("a-g         = go to saved pose");
+    Serial.println("R + a-g     = record pose to slot (saved to flash)");
+    Serial.println("a-g         = go to saved pose (smooth)");
     Serial.println("L           = list all saved poses");
+    Serial.println("C           = clear all saved poses (RAM + flash)");
     Serial.println("H           = slow homing sequence (gripper->wrist->elbow->shoulder->base)");
     Serial.println("---------------------------------------");
     Serial.println(">>> Channel: 0");
@@ -199,10 +331,17 @@ void loop()
             return;
         }
 
+        // C = clear all saved poses from RAM + flash
+        if (inChar == 'c' || inChar == 'C')
+        {
+            clearPosesFromFlash();
+            return;
+        }
+
         // R = record pose
         if (inChar == 'r' || inChar == 'R')
         {
-            Serial.println("Enter slot (a-i) to save pose:");
+            Serial.println("Enter slot (a-g) to save pose:");
             while (!Serial.available());
             char slot = tolower(Serial.read());
 
@@ -217,6 +356,7 @@ void loop()
                 Serial.print("Pose saved to slot ");
                 Serial.println(slot);
                 printPose(index);
+                persistPoses(); // write all current poses to flash
             }
             else
             {
@@ -225,7 +365,7 @@ void loop()
             return;
         }
 
-        // a-i = go to saved pose
+        // a-g = go to saved pose
         if (inChar >= 'a' && inChar <= 'g')
         {
             int index = poseIndex(inChar);
