@@ -55,19 +55,6 @@ int currentPWM[NUM_SERVOS]            = {1500, 1500, 1500, 1500, 1500, 1500};
 int savedPoses[NUM_POSES][NUM_SERVOS] = {0};
 bool poseSet[NUM_POSES]               = {false};
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ROBOT STATUS FSM
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-//   ┌─────────┐  init complete   ┌──────────┐  motion cmd   ┌──────────┐
-//   │  INIT   │ ───────────────► │   IDLE   │ ────────────► │   BUSY   │
-//   └─────────┘                  └──────────┘               └──────────┘
-//                                     ▲                           │
-//                                     └─────── motion done ───────┘
-//
-//  INIT  – hardware starting up, no commands accepted
-//  IDLE  – arm is stationary, all commands accepted
-//  BUSY  – arm is moving, only 'Q' (emergency stop) accepted
 //
 enum RobotStatus {
     STATUS_INIT,
@@ -99,7 +86,7 @@ bool isBusy() {
 }
 
 // ── Emergency stop flag ───────────────────────────────────────────────────────
-// Set to true by 'Q' in loop(); checked inside long motion loops to abort early.
+// Set to true by 'Z' in loop(); checked inside long motion loops to abort early.
 volatile bool eStop = false;
 
 // ── Input state machine ───────────────────────────────────────────────────────
@@ -272,7 +259,7 @@ void printAllSequences() {
 }
 
 // ── Motion ────────────────────────────────────────────────────────────────────
-// All motion functions check eStop each tick so 'Q' can abort mid-move.
+// All motion functions check eStop each tick so 'Z' can abort mid-move.
 
 void moveServoSmooth(int channel, int targetPWM, int incrementSize, int delayMs) {
     targetPWM = clampToJointLimits(channel, targetPWM);
@@ -309,7 +296,7 @@ void moveToPose(int index) {
     }
     int steps = max(1, maxDist / POSE_STEP);
     for (int s = 1; s <= steps; s++) {
-        // ── Check for Q mid-interpolation ────────────────────────────────────
+        // ── Check for Z mid-interpolation ────────────────────────────────────
         while (Serial.available()) {
             char peek = Serial.read();
             if (peek == 'z' || peek == 'Z') {
@@ -535,7 +522,7 @@ void setup() {
     }
     
     homeArm();
-    
+
     Serial.println("\n--- 6DOF Arm Controller ---");
     Serial.println("V      print robot status");
     Serial.println("Z      emergency stop");
