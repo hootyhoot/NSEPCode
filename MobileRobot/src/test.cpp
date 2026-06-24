@@ -388,6 +388,15 @@ void mission9()
 }
 void missionLineFollow()
 {
+    // Override global speeds for line follow — restore on exit
+    uint8_t prev_UL = speed_Upper_L, prev_LL = speed_Lower_L;
+    uint8_t prev_UR = speed_Upper_R, prev_LR = speed_Lower_R;
+
+    speed_Upper_L = 40;
+    speed_Lower_L = 40;
+    speed_Upper_R = 40;
+    speed_Lower_R = 40;
+
     Serial.println("Line Follow Mode - Press OK to Exit");
 
     unsigned long lastPrint = 0;
@@ -398,47 +407,39 @@ void missionLineFollow()
         int M = !digitalRead(SensorMiddle);
         int R = !digitalRead(SensorRight);
 
+
         const char* direction;
 
-        if((L == 0 && M == 1 && R == 0) || (L == 1 && M == 1 && R == 0) || (L == 0 && M == 1 && R == 1))
+        if(L == 0 && M == 1 && R == 0)
+        //if the middle is on a line, or the outer two are on a line go straight
         {
             direction = "FORWARD";
-            car.Motor_Upper_L(1, 60);
-            car.Motor_Lower_L(1, 58);
-            car.Motor_Upper_R(1, 65);
-            car.Motor_Lower_R(1, 65);
+            car.Advance();
+            delay(20);
         }
         else if(L == 1 && M == 1 && R == 1)
+        //if all on a line then at an intersection slow down a bit
         {
             direction = "INTERSECTION";
-            car.Motor_Upper_L(1, 60);
-            car.Motor_Lower_L(1, 58);
-            car.Motor_Upper_R(1, 65);
-            car.Motor_Lower_R(1, 65);
+            car.Stop();
         }
-        else if(L == 1 && M == 0 && R == 0)
+        else if((L == 1 && M == 0 && R == 0) || (L == 1 && M == 1 && R == 0))
+        //if left on a line then turn left
         {
             direction = "LEFT";
-            car.Motor_Upper_L(0, 0);
-            car.Motor_Lower_L(1, 100);
-            car.Motor_Upper_R(1, 100);
-            car.Motor_Lower_R(0, 0);
+            car.L_Move();
         }
-        else if(L == 0 && M == 0 && R == 1)
+        else if((L == 0 && M == 0 && R == 1) || (L == 0 && M == 1 && R == 1))
+        //if right on a line then turn right
         {
             direction = "RIGHT";
-            car.Motor_Upper_L(1, 100);
-            car.Motor_Lower_L(0, 0);
-            car.Motor_Upper_R(0, 0);
-            car.Motor_Lower_R(1, 100);
+            car.R_Move();
         }
         else
+        //no line detected reverse back
         {
             direction = "No line detected";
-            car.Motor_Upper_L(0, 20);
-            car.Motor_Lower_L(0, 20);
-            car.Motor_Upper_R(0, 20);
-            car.Motor_Lower_R(0, 20);
+            car.Stop();
         }
 
         if(millis() - lastPrint >= 200)
@@ -462,9 +463,13 @@ void missionLineFollow()
             irrecv.resume();
         }
 
-        delay(20);
     }
 
+    // Restore global speeds
+    speed_Upper_L = prev_UL;
+    speed_Lower_L = prev_LL;
+    speed_Upper_R = prev_UR;
+    speed_Lower_R = prev_LR;
 }
 
 void initState()
@@ -519,16 +524,16 @@ void initState()
     Serial.println("[CHECK] Motor Driver");
 
     car.Advance();
-    delay(100);
+    delay(10);
 
     car.Stop();
-    delay(100);
+    delay(10);
 
     car.Back();
-    delay(100);
+    delay(10);
 
     car.Stop();
-    delay(100);
+    delay(10);
 
     motorOK = true;
 
@@ -542,7 +547,7 @@ void initState()
     // -------------------------
     // Result
     // -------------------------
-    if(ultrasonicOK && servoOK && motorOK)
+    if(ultrasonicOK && motorOK)
     {
         Serial.println();
         Serial.println("SYSTEM STATUS : READY");
@@ -670,7 +675,7 @@ void loop()
                 case BTN_8:
                     mission8();
                     break;
-                
+
                 case BTN_9:
                     mission9();
                     break;
