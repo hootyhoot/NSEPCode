@@ -51,10 +51,10 @@ void setup()
     car.right_led(1);
 
     // Smooth speed
-    speed_Upper_L = 30;
-    speed_Lower_L = 28;
-    speed_Upper_R = 34;
-    speed_Lower_R = 34;
+    // speed_Upper_L = 45;
+    // speed_Lower_L = 45;
+    // speed_Upper_R = 45;
+    // speed_Lower_R = 45;
 
     pinMode(SensorLeft, INPUT);
     pinMode(SensorMiddle, INPUT);
@@ -135,7 +135,7 @@ void loop()
             intersectionFlag = true;
         }
 
-        if(intersectionCount == 5)
+        if(intersectionCount >= 5 && intersectionFlag)
         {
             Serial.println("5TH INTERSECTION");
             Serial.println("TURN RIGHT");
@@ -144,16 +144,20 @@ void loop()
             delay(200);
 
             car.Advance();
-            delay(200);
-
-            car.Stop();
             delay(100);
 
             car.Turn_Right();
-            delay(650);
+            delay(780);
+
+            car.Stop();
+
+            car.L_Move();
+            delay(3000);
 
             car.Stop();
             delay(200);
+
+            exit(0);
 
             intersectionCount = 0;
         }
