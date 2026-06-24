@@ -7,9 +7,15 @@
 // Robot
 mecanumCar car(3, 2);
 
+// Line sensors
+#define SensorLeft   A0
+#define SensorMiddle A1
+#define SensorRight  A2
+
 // IR Receiver
 IRrecv irrecv(A3);
 decode_results results;
+
 
 #define EchoPin 13
 #define TrigPin 12
@@ -293,30 +299,30 @@ void mission9()
         else if(distance > 30)
         {
             // Fast speed
-            speed_Upper_L = 100;
-            speed_Lower_L = 100;
-            speed_Upper_R = 100;
-            speed_Lower_R = 100;
+            speed_Upper_L = 84;
+            speed_Lower_L = 81;
+            speed_Upper_R = 88;
+            speed_Lower_R = 88;
 
             car.Advance();
         }
         else if(distance > 15)
         {
             // Medium speed
-            speed_Upper_L = 60;
-            speed_Lower_L = 60;
-            speed_Upper_R = 60;
-            speed_Lower_R = 60;
+            speed_Upper_L = 64;
+            speed_Lower_L = 61;
+            speed_Upper_R = 68;
+            speed_Lower_R = 68;
 
             car.Advance();
         }
         else if(distance > 5)
         {
             // Slow speed for accurate pickup
-            speed_Upper_L = 25;
-            speed_Lower_L = 25;
-            speed_Upper_R = 25;
-            speed_Lower_R = 25;
+            speed_Upper_L = 39;
+            speed_Lower_L = 36;
+            speed_Upper_R = 43;
+            speed_Lower_R = 43;
 
             car.Advance();
         }
@@ -380,6 +386,190 @@ void mission9()
         delay(100);
     }
 }
+void missionLineFollow()
+{
+    Serial.println("Line Follow Mode - Press OK to Exit");
+
+    unsigned long lastPrint = 0;
+
+    while(true)
+    {
+        int L = !digitalRead(SensorLeft);
+        int M = !digitalRead(SensorMiddle);
+        int R = !digitalRead(SensorRight);
+
+        const char* direction;
+
+        if((L == 0 && M == 1 && R == 0) || (L == 1 && M == 1 && R == 0) || (L == 0 && M == 1 && R == 1))
+        {
+            direction = "FORWARD";
+            car.Motor_Upper_L(1, 60);
+            car.Motor_Lower_L(1, 58);
+            car.Motor_Upper_R(1, 65);
+            car.Motor_Lower_R(1, 65);
+        }
+        else if(L == 1 && M == 1 && R == 1)
+        {
+            direction = "INTERSECTION";
+            car.Motor_Upper_L(1, 60);
+            car.Motor_Lower_L(1, 58);
+            car.Motor_Upper_R(1, 65);
+            car.Motor_Lower_R(1, 65);
+        }
+        else if(L == 1 && M == 0 && R == 0)
+        {
+            direction = "LEFT";
+            car.Motor_Upper_L(0, 0);
+            car.Motor_Lower_L(1, 100);
+            car.Motor_Upper_R(1, 100);
+            car.Motor_Lower_R(0, 0);
+        }
+        else if(L == 0 && M == 0 && R == 1)
+        {
+            direction = "RIGHT";
+            car.Motor_Upper_L(1, 100);
+            car.Motor_Lower_L(0, 0);
+            car.Motor_Upper_R(0, 0);
+            car.Motor_Lower_R(1, 100);
+        }
+        else
+        {
+            direction = "No line detected";
+            car.Motor_Upper_L(0, 20);
+            car.Motor_Lower_L(0, 20);
+            car.Motor_Upper_R(0, 20);
+            car.Motor_Lower_R(0, 20);
+        }
+
+        if(millis() - lastPrint >= 200)
+        {
+            Serial.print("L="); Serial.print(L);
+            Serial.print(" M="); Serial.print(M);
+            Serial.print(" R="); Serial.print(R);
+            Serial.print(" -> "); Serial.println(direction);
+            lastPrint = millis();
+        }
+
+        if(irrecv.decode(&results))
+        {
+            if(results.value == BTN_OK)
+            {
+                car.Stop();
+                Serial.println("Exit Line Follow Mode");
+                irrecv.resume();
+                break;
+            }
+            irrecv.resume();
+        }
+
+        delay(20);
+    }
+
+}
+
+void initState()
+{
+    Serial.println();
+    Serial.println("=========================");
+    Serial.println("INITIALIZATION STATE");
+    Serial.println("=========================");
+
+    bool ultrasonicOK = false;
+    bool servoOK = false;
+    bool motorOK = false;
+
+    car.left_led(1);
+    car.right_led(1);
+
+    // -------------------------
+    // Ultrasonic Test
+    // -------------------------
+    Serial.println("[CHECK] Ultrasonic");
+
+    delay(1000);
+
+    int distance = get_distance();
+
+    ultrasonicOK = true;
+
+    Serial.print("Ultrasonic Reading: ");
+    Serial.print(distance);
+    Serial.println(" cm");
+
+    // -------------------------
+    // Servo Test
+    // -------------------------
+    Serial.println("[CHECK] Gripper Servo");
+
+    openGripper();
+    delay(500);
+
+    closeGripper();
+    delay(500);
+
+    openGripper();
+
+    servoOK = true;
+
+    Serial.println("[PASS] Servo");
+
+    // -------------------------
+    // Motor Test
+    // -------------------------
+    Serial.println("[CHECK] Motor Driver");
+
+    car.Advance();
+    delay(100);
+
+    car.Stop();
+    delay(100);
+
+    car.Back();
+    delay(100);
+
+    car.Stop();
+    delay(100);
+
+    motorOK = true;
+
+    Serial.println("[PASS] Motors");
+
+        speed_Upper_L = 114;
+        speed_Lower_L = 111;
+        speed_Upper_R = 118;
+        speed_Lower_R = 118;
+
+    // -------------------------
+    // Result
+    // -------------------------
+    if(ultrasonicOK && servoOK && motorOK)
+    {
+        Serial.println();
+        Serial.println("SYSTEM STATUS : READY");
+
+        car.left_led(0);
+        car.right_led(0);
+    }
+    else
+    {
+        Serial.println();
+        Serial.println("SYSTEM STATUS : FAULT");
+
+        while(true)
+        {
+            car.left_led(1);
+            car.right_led(1);
+            delay(200);
+
+            car.left_led(0);
+            car.right_led(0);
+            delay(200);
+        }
+    }
+
+    Serial.println("=========================");
+}
+
 
 
 // =====================
@@ -394,15 +584,22 @@ void setup()
     gripper.attach(9);
     gripper.write(GRIP_OPEN);
 
-    speed_Upper_L = 100;
-    speed_Lower_L = 100;
-    speed_Upper_R = 100;
-    speed_Lower_R = 100;
+    speed_Upper_L = 114;
+    speed_Lower_L = 111;
+    speed_Upper_R = 118;
+    speed_Lower_R = 118;
 
     pinMode(EchoPin, INPUT);
     pinMode(TrigPin, OUTPUT);
 
+    pinMode(SensorLeft, INPUT);
+    pinMode(SensorMiddle, INPUT);
+    pinMode(SensorRight, INPUT);
+
     irrecv.enableIRIn();
+
+    // Run self-audit automatically
+    initState();
 
     Serial.println();
     Serial.println("==============================");
@@ -419,10 +616,11 @@ void setup()
     Serial.println("9 = Auto Pick Object");
     Serial.println("0 = Open Gripper");
     Serial.println("# = Close Gripper");
-    Serial.println("* = Reset Gripper");
+    Serial.println("* = Line Follow Mode");
     Serial.println("OK = Emergency Stop");
     Serial.println();
 }
+
 
 // =====================
 // Main Loop
@@ -479,7 +677,7 @@ void loop()
 
                 case BTN_UP:
                     car.Advance();
-                    delay(300);
+                    delay(3000);
                     car.Stop();
                     break;
 
@@ -510,9 +708,7 @@ void loop()
                     break;
 
                 case BTN_STAR:
-                    gripPos = GRIP_OPEN;
-                    gripper.write(gripPos);
-                    Serial.println("Gripper Reset");
+                    missionLineFollow();
                     break;
 
                 case BTN_OK:
