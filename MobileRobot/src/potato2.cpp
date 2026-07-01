@@ -30,16 +30,40 @@ int gripPos = GRIP_OPEN;
 #define SPEED_SLOW    25
 #define SPEED_ROTATE  60
 #define SLOW_AT_CM    8
-#define GRAB_AT_CM    5
+#define GRAB_AT_CM    3
+
+// Inner-wheel speed as a percentage of outer-wheel speed during line-follow
+// correction. Lower = gentler steer, less zigzag, slower recovery.
+// Higher = snappier correction, more prone to overshoot.
+#define SOFT_TURN_PCT 35
+
+// Per-wheel calibration trims (measured motor speed mismatch)
+const float trimUL = 24.0 / 28.0;
+const float trimLL = 21.0 / 28.0;
+const float trimUR = 28.0 / 28.0;
+const float trimLR = 27.0 / 28.0;
 
 // ===== Turn tuning =====
-// Don't check the right sensor at all for this long after the turn starts.
+// Don't check sensors at all for this long after the turn starts (blind, fast spin).
 // Prevents the robot from immediately re-detecting its own starting line.
 #define TURN_MIN_ROTATE_MS   250
 
-// After the right sensor first sees the new line, coast this many ms before stopping.
-// Helps the robot settle squarely onto the new line rather than clipping the edge.
-#define TURN_LINE_SETTLE_MS  80
+// Rotation speed during the blind window — can be fast since sensors aren't watched yet.
+#define SPEED_ROTATE_BLIND   SPEED_ROTATE
+
+// Rotation speed during the closed-loop seek window — kept slow so the robot travels
+// only a small angle between sensor polls, preventing the 90°->120°+ overshoot.
+#define SPEED_ROTATE_SEEK    28
+
+// How often to poll sensors during the seek window (ms). Small = tighter feedback loop.
+#define TURN_POLL_MS          5
+
+// Once a sensor first reports the new line, it must stay reporting it for this long
+// (continuously) before the turn is considered complete. Filters out single-sample noise.
+#define TURN_LINE_SETTLE_MS  60
+
+// Safety cutoff so a missed line can't spin the robot forever.
+#define TURN_SEEK_TIMEOUT_MS 3000
 
 // ===== Intersection debounce =====
 #define INTERSECTION_DEBOUNCE_MS 200
@@ -92,15 +116,34 @@ int get_distance()
 
 void setSpeed(uint8_t spd)
 {
-    const float trimUL = 24.0 / 28.0; 
-    const float trimLL = 21.0 / 28.0;
-    const float trimUR = 28.0 / 28.0;
-    const float trimLR = 27.0 / 28.0;
-
     speed_Upper_L = (uint8_t)(spd * trimUL);
     speed_Lower_L = (uint8_t)(spd * trimLL);
     speed_Upper_R = (uint8_t)(spd * trimUR);
     speed_Lower_R = (uint8_t)(spd * trimLR);
+}
+
+// Gentle differential steer for line-follow correction: outer side runs at
+// full commanded speed, inner side is slowed (not reversed) to bank the
+// robot back onto the line without the overshoot a full pivot turn causes.
+void softSteer(uint8_t spd, bool steerLeft)
+{
+    uint8_t outer = spd;
+    uint8_t inner = (uint8_t)((uint32_t)spd * SOFT_TURN_PCT / 100);
+
+    if(steerLeft)
+    {
+        car.Motor_Upper_L(1, (uint8_t)(inner * trimUL));
+        car.Motor_Lower_L(1, (uint8_t)(inner * trimLL));
+        car.Motor_Upper_R(1, (uint8_t)(outer * trimUR));
+        car.Motor_Lower_R(1, (uint8_t)(outer * trimLR));
+    }
+    else
+    {
+        car.Motor_Upper_L(1, (uint8_t)(outer * trimUL));
+        car.Motor_Lower_L(1, (uint8_t)(outer * trimLL));
+        car.Motor_Upper_R(1, (uint8_t)(inner * trimUR));
+        car.Motor_Lower_R(1, (uint8_t)(inner * trimLR));
+    }
 }
 
 void openGripper()
@@ -176,44 +219,78 @@ bool checkIntersection(int L, int M, int R)
 
 void lineFollow(int L, int M, int R, uint8_t spd)
 {
-    setSpeed(spd);
-    if     (L == 0 && M == 1 && R == 0)  car.Advance();
-    else if(L == 1 && R == 0)            car.Turn_Left();
-    else if(L == 0 && R == 1)            car.Turn_Right();
+    if     (L == 0 && M == 1 && R == 0)  { setSpeed(spd); car.Advance(); }
+    else if(L == 1 && R == 0)            softSteer(spd, true);
+    else if(L == 0 && R == 1)            softSteer(spd, false);
     else                                  car.Stop();
 }
 
-// Watches ONLY the right sensor during a left pivot-turn.
+// Closed-loop 90 deg pivot turn using all 3 forward IR sensors.
 //
-// Logic:
-//   1. TURN_MIN_ROTATE_MS guard — ignore the right sensor completely for the
-//      first 400 ms so the robot can't snap back onto the line it just left.
-//   2. Once the guard expires, watch for the right sensor to go HIGH.
-//   3. When it first goes HIGH, latch the timestamp (turnLineDetectedAt).
-//   4. After TURN_LINE_SETTLE_MS ms of the sensor staying HIGH, stop and
-//      return true — the robot is now squarely on the new line.
+// Stage 1 (blind): rotate fast for TURN_MIN_ROTATE_MS so the robot can't
+// immediately re-detect the line it just left.
 //
-// Returns true when the turn is complete.
-bool checkTurnLine(TurnDir dir)
+// Stage 2 (seek): rotate slowly and poll sensors every TURN_POLL_MS. Stopping
+// is decided by:
+//   - the DIRECTIONAL sensor (Left for a left turn, Right for a right turn)
+//     going HIGH — this is the expected, on-target detection.
+//   - the MIDDLE sensor going HIGH as a fallback — catches the case where the
+//     turn overshot slightly and the directional sensor swept past the line
+//     before the front-center sensor crossed it, so the robot doesn't spin
+//     past the line entirely.
+// Either trigger must stay HIGH continuously for TURN_LINE_SETTLE_MS before
+// the turn is accepted, filtering out single-sample noise/glitches.
+//
+// Blocking by design — matches the rest of this file's phase-transition style
+// (see the delay()-based sequences elsewhere) and keeps the seek poll rate
+// independent of the main loop's ~20ms cadence, which is what caused the
+// original overshoot (too much angle traveled between checks at full speed).
+bool performTurn90(TurnDir dir)
 {
-    unsigned long now = millis();
+    // Stage 1: blind fast spin
+    setSpeed(SPEED_ROTATE_BLIND);
+    if(dir == TURN_DIR_LEFT) car.Turn_Left(); else car.Turn_Right();
+    delay(TURN_MIN_ROTATE_MS);
 
-    // Guard: minimum rotation time not yet elapsed
-    if(now - turnStartedAt < TURN_MIN_ROTATE_MS) return false;
+    // Stage 2: slow closed-loop seek
+    setSpeed(SPEED_ROTATE_SEEK);
+    if(dir == TURN_DIR_LEFT) car.Turn_Left(); else car.Turn_Right();
 
-    int sensorVal = (dir == TURN_DIR_LEFT) ? digitalRead(SensorLeft)
-                                            : digitalRead(SensorRight);
+    unsigned long seekStart   = millis();
+    unsigned long settleStart = 0;
+    bool          settling    = false;
 
-    if(sensorVal == HIGH)
+    while(millis() - seekStart < TURN_SEEK_TIMEOUT_MS)
     {
-        car.Stop();
-        Serial.println(dir == TURN_DIR_LEFT
-            ? "TURN: 90 deg complete — right sensor on line"
-            : "TURN: 90 deg complete — left sensor on line");
-        return true;
+        int L = digitalRead(SensorLeft);
+        int M = digitalRead(SensorMiddle);
+        int R = digitalRead(SensorRight);
+
+        bool targetHit = (dir == TURN_DIR_LEFT) ? (L == HIGH) : (R == HIGH);
+        bool centerHit = (M == HIGH);
+
+        if(targetHit || centerHit)
+        {
+            if(!settling) { settling = true; settleStart = millis(); }
+            if(millis() - settleStart >= TURN_LINE_SETTLE_MS)
+            {
+                car.Stop();
+                Serial.println(dir == TURN_DIR_LEFT
+                    ? "TURN LEFT: 90 deg complete"
+                    : "TURN RIGHT: 90 deg complete");
+                return true;
+            }
+        }
+        else
+        {
+            settling = false;  // lost the line before settle completed — false alarm
+        }
+
+        delay(TURN_POLL_MS);
     }
 
-
+    car.Stop();
+    Serial.println("TURN: timeout — line not found");
     return false;
 }
 
@@ -272,6 +349,7 @@ void loop()
             if(intersectionCount >= 4 && !intersectionFlag) {
                 car.Stop();
                 delay(50);
+                intersectionCount = 0;
                 transitionTo(PHASE_TURN_RIGHT_90);
             }
             else {
@@ -281,10 +359,10 @@ void loop()
             break;
         }
 
-        // ── Phase 2: pivot-rotate left, stop when right sensor sees new line ──
+        // ── Phase 2: closed-loop pivot-rotate left until left sensor sees new line ──
         case PHASE_TURN_LEFT_90:
         {
-            if(checkTurnLine(TURN_DIR_LEFT))
+            if(performTurn90(TURN_DIR_LEFT))
             {
                 delay(100);
                 setSpeed(SPEED_SLOW);
@@ -294,11 +372,7 @@ void loop()
                 delay(50);
                 transitionTo(PHASE_APPROACH);
             }
-            else
-            {
-                setSpeed(SPEED_ROTATE);
-                car.Turn_Left();
-            }
+            // else: timed out — stays in this phase, retries next loop() call
             break;
         }
 
@@ -309,6 +383,7 @@ void loop()
             if(intersectionCount >= 2 && !intersectionFlag) {
                 car.Stop();
                 delay(50);
+                intersectionCount = 0;
                 transitionTo(PHASE_TURN_LEFT_90);
             }
             else
@@ -318,7 +393,7 @@ void loop()
 
         case PHASE_TURN_RIGHT_90:
         {
-            if(checkTurnLine(TURN_DIR_RIGHT))
+            if(performTurn90(TURN_DIR_RIGHT))
             {
                 delay(100);
                 setSpeed(SPEED_SLOW);
@@ -328,11 +403,7 @@ void loop()
                 delay(50);
                 transitionTo(PHASE_FORWARD_2);
             }
-            else
-            {
-                setSpeed(SPEED_ROTATE);
-                car.Turn_Right();
-            }
+            // else: timed out — stays in this phase, retries next loop() call
             break;
         }
 
@@ -367,45 +438,29 @@ void loop()
         {
             setSpeed(SPEED_NORMAL);
 
-            // ---- First 90-degree pivot ----
-            car.Turn_Left();
-            delay(TURN_MIN_ROTATE_MS); // ignore sensor briefly so it doesn't trigger on starting line
-
-            while (true)
-            {
+            for(int i=0; i < 2; i++) {
+                car.Turn_Left();
+                delay(TURN_MIN_ROTATE_MS);
+                bool turnFlag = false;
+                while (!turnFlag) {
                     int L = digitalRead(SensorLeft);
-                    if (L == HIGH)
-                        {
+                    if (L == HIGH) {
+                        turnFlag = true;
                         car.Stop();
                         Serial.println("TURN180: first 90 deg done");
-                        break;
-                        }
-            }
-
-            delay(50); // small settle pause before next pivot
-
-            // ---- Second 90-degree pivot ----
-            car.Turn_Left();
-            delay(TURN_MIN_ROTATE_MS);
-
-            while (true)
-            {
-                 int L = digitalRead(SensorLeft);
-                if (L == HIGH)
-                    {
-                    car.Stop();
-                    Serial.println("TURN180: second 90 deg done — 180 complete");
-                    break;
+                        delay(50);
                     }
+                }
             }
+
 
             transitionTo(PHASE_DROP);
+            break;
 
-            delay(100);
         }
 
 
-        
+
         case PHASE_DROP:
         {
             openGripper();
